@@ -6,7 +6,7 @@ import {money,allReportRows,type WageRow} from "../lib/report";
 import {chooseFile,fileName,standaloneHtml,writeLocal} from "../lib/local-files";
 import {preparePrintReport,printPreparedReport,type ReportScope} from "../lib/print-report";
 
-type Quote={id:number;clientName:string;siteName:string;quoteDate:string;totalPrice:number;data:unknown};
+import {browserQuoteStore,LOCAL_QUOTES_KEY,type LocalQuote as Quote} from "../lib/local-proposals";
 const num=(value:string)=>Number.isFinite(Number(value))?Math.max(0,Number(value)):0;
 function Field({label,value,onChange,suffix,step=".01"}:{label:string;value:number;onChange:(v:number)=>void;suffix?:string;step?:string}){
  return <label className="field"><span>{label}</span><div className="input-wrap"><input type="number" min="0" step={step} value={value} onChange={e=>onChange(num(e.target.value))}/>{suffix&&<b>{suffix}</b>}</div></label>;
@@ -18,16 +18,21 @@ export default function Home(){
  const [printPreview,setPrintPreview]=useState<HTMLElement|null>(null);
  const [chooseLocation,setChooseLocation]=useState(false),[download,setDownload]=useState<{url:string;name:string}|null>(null);
  const fileInput=useRef<HTMLInputElement>(null),reportRoot=useRef<HTMLElement>(null),deleteDialog=useRef<HTMLDialogElement>(null);
- const openedQuoteId=useRef<number|null>(null);
+ const openedQuoteId=useRef<number|null>(null),backupInput=useRef<HTMLInputElement>(null);
  const printDialog=useRef<HTMLDialogElement>(null),printMount=useRef<HTMLDivElement>(null);
  const calculation=saved?.snapshot??calculate(form),{sample,totals,errors}=calculation;
  const canPrintFull=!!saved||savedSignature===JSON.stringify(form);
  const set=<K extends keyof FormData>(key:K,value:FormData[K])=>setForm(f=>({...f,[key]:value}));
- useEffect(()=>{let live=true;fetch("/api/quotes").then(async r=>{if(!r.ok)throw new Error();const j=await r.json();if(live)setQuotes(j.quotes);}).catch(()=>{if(live)setStatus("לא ניתן לטעון את ההצעות השמורות. אפשר להמשיך לעבוד ולשמור קובץ מקומי.");});return()=>{live=false;};},[]);
+ useEffect(()=>{
+  const refresh=()=>{try{setQuotes(browserQuoteStore().list());}catch(e){setStatus(errorText(e));}};
+  const changed=(event:StorageEvent)=>{if(event.key===LOCAL_QUOTES_KEY||event.key===null)refresh();};
+  refresh();window.addEventListener("storage",changed);
+  return()=>window.removeEventListener("storage",changed);
+ },[]);
  useEffect(()=>()=>{if(download)URL.revokeObjectURL(download.url);},[download]);
  useEffect(()=>{setDownload(null);},[form]);
  useEffect(()=>{if(pendingDelete)deleteDialog.current?.showModal();else deleteDialog.current?.close();},[pendingDelete]);
- async function reload(){const r=await fetch("/api/quotes");if(!r.ok)throw new Error("ההצעה נשמרה, אך רשימת ההצעות לא התרעננה. רענן את הדף.");setQuotes((await r.json()).quotes);}
+ function reload(){setQuotes(browserQuoteStore().list());}
  function proposal(){if(saved)return saved;const data=parseForm(form);if(errors.length)throw new Error(errors.join(" "));return makeProposal(data,calculation);}
  function errorText(e:unknown){return e instanceof Error?(e.name==="AbortError"?"הפעולה בוטלה; לא נשמר קובץ.":e.name==="NotAllowedError"||e.name==="SecurityError"?"הדפדפן לא אישר גישה לתיקייה. אפשר לבטל את בחירת התיקייה ולהשתמש בהורדה רגילה.":e.message):"הפעולה לא הצליחה. נסה שוב.";}
  async function save(){
@@ -35,10 +40,9 @@ export default function Home(){
   if(!form.clientName.trim()){setStatus("יש להזין שם לקוח לפני שמירה");document.getElementById("client-name")?.focus();return;}
   setBusy(true);setStatus("שומר הצעה...");
   try{
-   const r=await fetch("/api/quotes",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({id:quoteId,data:proposal()}),signal:AbortSignal.timeout(20000)});
-   const j=await r.json();if(!r.ok)throw new Error(j.error||"השמירה לא אושרה. ניתן לשמור קובץ מקומי.");
-   if(!j.quote?.id)throw new Error("לא התקבל אישור שמירה");
-   setQuoteId(j.quote.id);openedQuoteId.current=j.quote.id;setSavedSignature(JSON.stringify(form));setStatus("ההצעה נשמרה עם הנתונים ותוצאות החישוב. אפשר להדפיס את ההצעה המלאה.");await reload();
+   const q=browserQuoteStore().save(proposal(),quoteId);
+   setQuoteId(q.id);openedQuoteId.current=q.id;setSavedSignature(JSON.stringify(form));reload();
+   setStatus("ההצעה נשמרה בדפדפן במחשב זה, עם הנתונים והמחירים. אפשר להדפיס את ההצעה המלאה.");
   }catch(e){setStatus(errorText(e));}finally{setBusy(false);}
  }
  function loadProposal(value:unknown,id:number|null){
@@ -52,9 +56,7 @@ export default function Home(){
   if(!pendingDelete||busy)return;
   const target=pendingDelete;setBusy(true);
   try{
-   const r=await fetch(`/api/quotes?id=${target.id}`,{method:"DELETE",signal:AbortSignal.timeout(20000)});
-   const result=await r.json();if(!r.ok&&r.status!==404)throw new Error(result.error||"המחיקה לא הושלמה");
-   setQuotes(list=>list.filter(q=>q.id!==target.id));
+   browserQuoteStore().delete(target.id);reload();
    if(openedQuoteId.current===target.id)newProposal();
    setPendingDelete(null);setStatus(`ההצעה של ${target.clientName} נמחקה לצמיתות.`);
   }catch(e){setStatus(errorText(e));setPendingDelete(null);}finally{setBusy(false);}
@@ -66,6 +68,24 @@ export default function Home(){
    const text=await file.text();const json=text.trimStart().startsWith("<")?new DOMParser().parseFromString(text,"text/html").querySelector('script#proposal-data[type="application/json"]')?.textContent:text;
    if(!json)throw new Error("הקובץ אינו הצעה שנשמרה מהמחשבון.");loadProposal(JSON.parse(json),null);
   }catch(e){setStatus(errorText(e));}if(fileInput.current)fileInput.current.value="";
+ }
+ async function exportBackup(){
+  if(busy)return;setBusy(true);
+  try{
+   const backup=browserQuoteStore().backup(),name=`גיבוי-הצעות-${new Date().toISOString().slice(0,10)}.json`;
+   const handle=await chooseFile(name,"json","application/json",chooseLocation);
+   const blob=new Blob([JSON.stringify(backup,null,2)],{type:"application/json;charset=utf-8"});
+   if(await writeLocal(blob,handle))setStatus("גיבוי ההצעות נשמר במיקום שבחרת.");
+   else{setDownload({url:URL.createObjectURL(blob),name});setStatus("הגיבוי מוכן. לחץ על הורדת הקובץ לשמירה במחשב.");}
+  }catch(e){setStatus(errorText(e));}finally{setBusy(false);}
+ }
+ async function importBackup(file:File|undefined){
+  if(!file||busy)return;setBusy(true);
+  try{
+   if(file.size>20*1024*1024)throw new Error("קובץ הגיבוי גדול מדי (עד 20MB).");
+   const added=browserQuoteStore().importBackup(JSON.parse(await file.text()));reload();
+   setStatus(`נטענו ${added} הצעות מהגיבוי. הצעות קיימות נשמרו; עותקים זהים לא נוספו שוב.`);
+  }catch(e){setStatus(errorText(e));}finally{setBusy(false);if(backupInput.current)backupInput.current.value="";}
  }
  function updateJob(id:string,key:keyof Job,value:number){setForm(f=>({...f,jobs:f.jobs.map(j=>j.id===id?{...j,[key]:value}:j)}));}
  function addCalculatorJob(){if(form.baseMonthlyHours<=0){setStatus("יש להזין כמות שעות גדולה מאפס.");return;}setForm(f=>({...f,jobs:[...f.jobs,{id:uid(),employees:1,tenure:f.tenureYears,workWeek:f.workWeek,regularHours:f.baseMonthlyHours,hours125:0,hours150:0}]}));setStatus("נוספה קבוצה לריכוז כוח האדם. ניתן להוסיף קבוצה נוספת בכל לחיצה.");}
@@ -125,9 +145,11 @@ export default function Home(){
   </div>;
  }
  return <main dir="rtl" ref={reportRoot}>
-  <header className="topbar"><div className="brand"><span className="logo"><Calculator/></span><div><h1>תמחיר שירותי ניקיון</h1><p>עלות שעה מפורטת ותמחור אתר</p></div></div><div className="actions"><button className="secondary" disabled={busy} onClick={newProposal}><Plus/>חדש</button><button className="secondary" disabled={busy} onClick={()=>fileInput.current?.click()}><FolderOpen/>פתיחה מהמחשב</button><button className="primary" onClick={save} disabled={busy||!!saved}><Save/>שמירה</button></div></header>
+  <header className="topbar"><div className="brand"><span className="logo"><Calculator/></span><div><h1>תמחיר שירותי ניקיון</h1><p>עלות שעה מפורטת ותמחור אתר</p></div></div><div className="actions"><button className="secondary" disabled={busy} onClick={newProposal}><Plus/>חדש</button><button className="secondary" disabled={busy} onClick={()=>fileInput.current?.click()}><FolderOpen/>פתיחה מהמחשב</button><button className="primary" onClick={save} disabled={busy||(!!saved&&quoteId!==null)}><Save/>שמירה בדפדפן</button></div></header>
   <input className="no-print" hidden ref={fileInput} type="file" accept=".html,.json" aria-label="קובץ הצעה מהמחשב" onChange={e=>void importLocal(e.target.files?.[0])}/>
+  <input className="no-print" hidden ref={backupInput} type="file" accept=".json" aria-label="קובץ גיבוי הצעות" onChange={e=>void importBackup(e.target.files?.[0])}/>
   <div className="sheet-shell">
+   <p className="local-storage-note no-print"><strong>הצעות נשמרות רק במחשב זה.</strong> השמירה בדפדפן אינה מסתנכרנת למחשב אחר. מומלץ להוריד גיבוי לקובץ; ניקוי נתוני הדפדפן מוחק את הרשימה המקומית.</p>
    <div className="print-actions no-print"><div className="print-buttons"><button onClick={()=>void printReport("section1")} disabled={busy||form.baseMonthlyHours<=0}><Printer/>הדפסת סעיף 1</button><button onClick={()=>void printReport("full")} disabled={busy||!canPrintFull||!!errors.length}><Printer/>הדפסת הצעה מלאה</button></div><span>{canPrintFull?"הדפסת A4 או שמירה כ־PDF בחלון ההדפסה":"להדפסה מלאה יש לשמור את ההצעה לאחר השינוי האחרון."}</span></div>
    {status&&<p role="status" className="status-message">{status}</p>}
    {saved&&<div className="saved-notice no-print"><span>תצוגה שמורה • {saved.calculationVersion} • המחירים המקוריים נשמרו.</span><button onClick={()=>{if(saved.calculationVersion!==CALCULATION_VERSION)setQuoteId(null);setSaved(null);setSavedSignature(null);setDownload(null);setStatus("ההצעה נפתחה לעריכה וחושבה לפי הגרסה הנוכחית.");}}>עריכת הצעה</button></div>}
@@ -169,7 +191,7 @@ export default function Home(){
    {status&&<p role="note" className="export-status no-print">{status}</p>}
    {download&&<div className="download-ready no-print"><a href={download.url} download={download.name}><Download/>הורדת הקובץ — {download.name}</a><small>אם הדפדפן לא שואל היכן לשמור, הקובץ יישמר בתיקיית ההורדות המוגדרת בו.</small></div>}
    <p className="report-note">גרסת חישוב: {saved?.calculationVersion??CALCULATION_VERSION} • בסיס חופשה והבראה: {form.leaveBasis==="workbook"?"נוסחאות האקסל שהועלה":"שעות עבודה בפועל"}. רכיבי גב אל גב אינם כלולים במחיר; החיוב הנפרד יכלול את עלויות המעסיק הרלוונטיות בהתאם לזכאות ולביצוע. הקובץ המקומי שומר את המראה והמחירים וניתן לפתוח אותו שוב במחשבון.</p>
-   <section className="card history"><div className="section-head"><h3><History/> הצעות שמורות</h3><span>{quotes.length} הצעות</span></div><div className="saved-list">{quotes.map(q=><div className="saved-row" key={q.id}><button className="open-quote" disabled={busy} onClick={()=>open(q)}><span><b>{q.clientName}</b><small>{q.siteName||"ללא אתר"} • {q.quoteDate}</small></span><strong>{money(q.totalPrice)}</strong></button><button className="delete-quote" disabled={busy} aria-label={`מחיקת הצעה — ${q.clientName}`} onClick={()=>setPendingDelete(q)}><Trash2/><span>מחיקה</span></button></div>)}{!quotes.length&&<p className="empty">אין הצעות שמורות להצגה.</p>}</div></section>
+   <section className="card history"><div className="section-head"><h3><History/> הצעות שמורות במחשב זה</h3><span>{quotes.length} הצעות</span></div><div className="backup-actions"><button disabled={busy||!quotes.length} onClick={()=>void exportBackup()}><Download/>גיבוי כל ההצעות לקובץ</button><button disabled={busy} onClick={()=>backupInput.current?.click()}><FolderOpen/>טעינת גיבוי מהמחשב</button></div><div className="saved-list">{quotes.map(q=><div className="saved-row" key={q.id}><button className="open-quote" disabled={busy} onClick={()=>open(q)}><span><b>{q.clientName}</b><small>{q.siteName||"ללא אתר"} • {q.quoteDate}</small></span><strong>{money(q.totalPrice)}</strong></button><button className="delete-quote" disabled={busy} aria-label={`מחיקת הצעה — ${q.clientName}`} onClick={()=>setPendingDelete(q)}><Trash2/><span>מחיקה</span></button></div>)}{!quotes.length&&<p className="empty">אין הצעות שמורות להצגה.</p>}</div></section>
   </div>
   <dialog ref={printDialog} className="print-preview no-print" aria-label="תצוגה לפני הדפסה" onCancel={e=>{e.preventDefault();closePrintPreview();}}><div className="preview-actions"><span>תצוגה לפני הדפסה • A4 לרוחב</span><button onClick={()=>{if(printPreview)try{printPreparedReport(printPreview);}catch(e){setStatus(errorText(e));}}}><Printer/>הדפסה / שמירה כ־PDF</button><button onClick={closePrintPreview}>סגירת תצוגה</button></div><div className="preview-scroll" ref={printMount}/></dialog>
   <dialog ref={deleteDialog} className="delete-dialog no-print" aria-labelledby="delete-title" onCancel={e=>{e.preventDefault();if(!busy)setPendingDelete(null);}}><h3 id="delete-title">מחיקת הצעה לצמיתות</h3><p>למחוק את ההצעה של <b>{pendingDelete?.clientName}</b>? ההצעה תימחק מההצעות השמורות ולא ניתן יהיה לשחזר אותה.</p><div><button autoFocus disabled={busy} onClick={()=>setPendingDelete(null)}>ביטול</button><button className="danger" disabled={busy} onClick={()=>void deleteQuote()}>מחיקה לצמיתות</button></div></dialog>
